@@ -29,6 +29,8 @@ const ICAL = require("ical.js");
 const zod = require("zod");
 const crypto$1 = require("crypto");
 const generativeAi = require("@google/generative-ai");
+const child_process = require("child_process");
+const os = require("os");
 const util = require("util");
 const uuid = require("uuid");
 const events = require("events");
@@ -125,6 +127,24 @@ const optimizer = {
     });
   }
 };
+function encryptSensitive(value) {
+  try {
+    if (electron.safeStorage.isEncryptionAvailable() && value) {
+      return "__enc__" + electron.safeStorage.encryptString(value).toString("base64");
+    }
+  } catch {
+  }
+  return value;
+}
+function decryptSensitive(value) {
+  try {
+    if (value.startsWith("__enc__") && electron.safeStorage.isEncryptionAvailable()) {
+      return electron.safeStorage.decryptString(Buffer.from(value.slice(7), "base64"));
+    }
+  } catch {
+  }
+  return value;
+}
 const DEFAULT_CONFIG = {
   version: "1.0.0",
   storage: {
@@ -185,6 +205,9 @@ async function initializeConfig() {
     if (fs.existsSync(configPath)) {
       const fileContent = fs.readFileSync(configPath, "utf-8");
       const savedConfig = JSON.parse(fileContent);
+      if (savedConfig.calendar?.icsUrl) {
+        savedConfig.calendar.icsUrl = decryptSensitive(savedConfig.calendar.icsUrl);
+      }
       config = deepMerge(DEFAULT_CONFIG, savedConfig);
     } else {
       await saveConfig(DEFAULT_CONFIG);
@@ -204,7 +227,14 @@ async function saveConfig(newConfig) {
   if (!fs.existsSync(configDir)) {
     fs.mkdirSync(configDir, { recursive: true });
   }
-  fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
+  const toWrite = {
+    ...config,
+    calendar: {
+      ...config.calendar,
+      icsUrl: encryptSensitive(config.calendar.icsUrl)
+    }
+  };
+  fs.writeFileSync(configPath, JSON.stringify(toWrite, null, 2));
 }
 async function updateConfig(section, values) {
   const updatedSection = { ...config[section], ...values };
@@ -1497,6 +1527,12 @@ const MIGRATIONS = {
     console.log("Migration v21 complete: meeting_id backfill applied");
   }
 };
+function getExecutableSql(sql) {
+  return sql.split("\n").map((line) => line.trim()).filter((line) => line.length > 0 && !line.startsWith("--")).join(" ");
+}
+function isCreateTableStatement(sql) {
+  return getExecutableSql(sql).toUpperCase().startsWith("CREATE TABLE");
+}
 function runMigrations(currentVersion) {
   for (let v = currentVersion + 1; v <= SCHEMA_VERSION; v++) {
     const migration = MIGRATIONS[v];
@@ -1521,7 +1557,7 @@ async function initializeDatabase() {
     const statements = SCHEMA.split(";").map((s) => s.trim()).filter((s) => s.length > 0);
     console.log("[Database] Phase 1: Ensuring core tables exist...");
     for (const sql of statements) {
-      if (sql.toUpperCase().startsWith("CREATE TABLE")) {
+      if (isCreateTableStatement(sql)) {
         try {
           database2.run(sql);
         } catch (e) {
@@ -1531,7 +1567,7 @@ async function initializeDatabase() {
     }
     console.log("[Database] Phase 2: Aligning table structures...");
     const recordingsInfo = database2.exec("PRAGMA table_info(recordings)");
-    const recCols = recordingsInfo[0].values.map((col) => col[1]);
+    const recCols = recordingsInfo[0]?.values?.map((col) => col[1]) ?? [];
     const recordingRepairs = [
       { name: "migrated_to_capture_id", def: "TEXT" },
       { name: "migration_status", def: "TEXT CHECK(migration_status IN ('pending', 'migrated', 'skipped', 'error')) DEFAULT 'pending'" },
@@ -1547,7 +1583,7 @@ async function initializeDatabase() {
       }
     }
     const captureInfo = database2.exec("PRAGMA table_info(knowledge_captures)");
-    const capCols = captureInfo[0].values.map((col) => col[1]);
+    const capCols = captureInfo[0]?.values?.map((col) => col[1]) ?? [];
     const knowledgeRepairs = [
       { name: "category", def: "category TEXT CHECK(category IN ('meeting', 'interview', '1:1', 'brainstorm', 'note', 'other')) DEFAULT 'meeting'" },
       { name: "status", def: "status TEXT CHECK(status IN ('processing', 'ready', 'enriched')) DEFAULT 'ready'" },
@@ -2687,6 +2723,24 @@ function success(data) {
 function error(code, message, details) {
   return { success: false, error: { code, message, details } };
 }
+function emitActivityLog(type, message, details) {
+  const entry = {
+    type,
+    message,
+    details,
+    timestamp: /* @__PURE__ */ new Date()
+  };
+  const windows = electron.BrowserWindow.getAllWindows();
+  for (const win of windows) {
+    if (!win.isDestroyed() && !win.webContents.isDestroyed()) {
+      win.webContents.send("activity-log:entry", entry);
+    }
+  }
+}
+const activityLog = /* @__PURE__ */ Object.freeze(/* @__PURE__ */ Object.defineProperty({
+  __proto__: null,
+  emitActivityLog
+}, Symbol.toStringTag, { value: "Module" }));
 function registerConfigHandlers() {
   electron.ipcMain.handle("config:get", async () => {
     try {
@@ -2703,9 +2757,11 @@ function registerConfigHandlers() {
   electron.ipcMain.handle("config:set", async (_, newConfig) => {
     try {
       await saveConfig(newConfig);
+      emitActivityLog("info", "Settings saved");
       return success(getConfig());
     } catch (err) {
       console.error("[config:set] Error:", err);
+      emitActivityLog("error", "Failed to save settings", err instanceof Error ? err.message : void 0);
       return error(
         "VALIDATION_ERROR",
         err instanceof Error ? err.message : "Failed to save configuration",
@@ -2718,9 +2774,11 @@ function registerConfigHandlers() {
     async (_, section, values) => {
       try {
         await updateConfig(section, values);
+        emitActivityLog("info", `Settings updated: ${String(section)}`);
         return success(getConfig());
       } catch (err) {
         console.error(`[config:update-section] Error updating ${String(section)}:`, err);
+        emitActivityLog("error", `Failed to update ${String(section)} settings`, err instanceof Error ? err.message : void 0);
         return error(
           "VALIDATION_ERROR",
           err instanceof Error ? err.message : `Failed to update ${String(section)} settings`,
@@ -2934,6 +2992,9 @@ function categorizeCalendarError(error2) {
     return { message: error2.message, category: "network" };
   }
   const message = error2 instanceof Error ? error2.message : String(error2);
+  if (message.includes("401") || message.includes("403") || message.includes("Unauthorized") || message.includes("Forbidden") || message.includes("authentication") || message.includes("authorization")) {
+    return { message, category: "auth" };
+  }
   if (message.includes("fetch") || message.includes("ECONNREFUSED") || message.includes("ENOTFOUND") || message.includes("ETIMEDOUT") || message.includes("network") || message.includes("Failed to fetch") || message.includes("ERR_NETWORK") || /^Failed to fetch calendar: \d+/.test(message)) {
     return { message, category: "network" };
   }
@@ -3108,11 +3169,12 @@ function safeToJSDate(icalTime, tzidHint) {
 }
 async function syncCalendar(icsUrl) {
   console.log("Starting calendar sync...");
-  const { emitActivityLog } = await Promise.resolve().then(() => require("./chunks/activity-log-D93aD6mA.js"));
-  emitActivityLog("info", "Syncing calendar...", "Fetching calendar events");
+  const { emitActivityLog: emitActivityLog2 } = await Promise.resolve().then(() => activityLog);
+  emitActivityLog2("info", "Syncing calendar...", "Fetching calendar events");
   try {
     const validation = validateCalendarUrl(icsUrl);
     if (!validation.valid) {
+      emitActivityLog2("error", "Calendar sync failed", validation.error ?? "Invalid URL");
       return {
         success: false,
         meetingsCount: 0,
@@ -3126,7 +3188,8 @@ async function syncCalendar(icsUrl) {
     }
     const icsData = await response.text();
     const cachePath = path.join(getCachePath(), "calendar.ics");
-    fs.writeFileSync(cachePath, icsData, "utf-8");
+    const { writeFile } = await import("fs/promises");
+    await writeFile(cachePath, icsData, "utf-8");
     await yieldToEventLoop();
     const meetings = await parseICSAsync(icsData);
     await yieldToEventLoop();
@@ -3143,7 +3206,7 @@ async function syncCalendar(icsUrl) {
       console.error("Failed to persist sync timestamp:", configError);
     }
     console.log(`Calendar sync complete: ${meetings.length} meetings`);
-    emitActivityLog("success", "Calendar sync complete", `Loaded ${meetings.length} meetings`);
+    emitActivityLog2("success", "Calendar sync complete", `Loaded ${meetings.length} meetings`);
     return {
       success: true,
       meetingsCount: meetings.length,
@@ -3152,7 +3215,7 @@ async function syncCalendar(icsUrl) {
   } catch (error2) {
     console.error("Calendar sync failed:", error2);
     const categorized = categorizeCalendarError(error2);
-    emitActivityLog("error", "Calendar sync failed", categorized.message);
+    emitActivityLog2("error", "Calendar sync failed", categorized.message);
     return {
       success: false,
       meetingsCount: 0,
@@ -3174,7 +3237,8 @@ async function parseICSAsync(icsData) {
     }
     const vevent = vevents[eventIndex];
     const event = new ICAL.Event(vevent);
-    if (event.status === "CANCELLED") {
+    const eventStatus = vevent.getFirstPropertyValue("status");
+    if (eventStatus === "CANCELLED") {
       continue;
     }
     const uid = event.uid;
@@ -3242,7 +3306,8 @@ async function parseICSAsync(icsData) {
         organizer_email: organizerEmail,
         attendees: attendees.length > 0 ? JSON.stringify(attendees) : void 0,
         description,
-        is_recurring: 0,
+        // CS-005: Use actual isRecurring flag instead of hardcoded 0
+        is_recurring: isRecurring ? 1 : 0,
         recurrence_rule: void 0,
         meeting_url: meetingUrl
       });
@@ -3405,8 +3470,8 @@ function validateMinAgeOverride(override) {
 let syncInterval = null;
 function registerCalendarHandlers() {
   electron.ipcMain.handle("calendar:sync", async () => {
-    const config22 = getConfig();
-    if (!config22.calendar.icsUrl) {
+    const config2 = getConfig();
+    if (!config2.calendar.icsUrl) {
       return {
         success: false,
         error: "No calendar URL configured",
@@ -3414,7 +3479,7 @@ function registerCalendarHandlers() {
       };
     }
     try {
-      const result = await syncCalendar(config22.calendar.icsUrl);
+      const result = await syncCalendar(config2.calendar.icsUrl);
       if (!result || typeof result.success !== "boolean") {
         console.error("[calendar:sync] syncCalendar returned malformed result:", result);
         return { success: false, error: "Sync returned an invalid result", meetingsCount: 0 };
@@ -3427,8 +3492,8 @@ function registerCalendarHandlers() {
     }
   });
   electron.ipcMain.handle("calendar:clear-and-sync", async () => {
-    const config22 = getConfig();
-    if (!config22.calendar.icsUrl) {
+    const config2 = getConfig();
+    if (!config2.calendar.icsUrl) {
       return {
         success: false,
         error: "No calendar URL configured",
@@ -3437,7 +3502,7 @@ function registerCalendarHandlers() {
     }
     try {
       clearAllMeetings();
-      const result = await syncCalendar(config22.calendar.icsUrl);
+      const result = await syncCalendar(config2.calendar.icsUrl);
       if (!result || typeof result.success !== "boolean") {
         console.error("[calendar:clear-and-sync] syncCalendar returned malformed result:", result);
         return { success: false, error: "Sync returned an invalid result", meetingsCount: 0 };
@@ -3490,8 +3555,8 @@ function registerCalendarHandlers() {
         return { success: false, error: result.error.issues[0]?.message || "Invalid interval" };
       }
       await updateConfig("calendar", { syncIntervalMinutes: result.data.minutes });
-      const config22 = getConfig();
-      if (config22.calendar.syncEnabled) {
+      const config2 = getConfig();
+      if (config2.calendar.syncEnabled) {
         stopAutoSync();
         startAutoSync();
       }
@@ -3504,6 +3569,8 @@ function registerCalendarHandlers() {
   electron.ipcMain.handle("calendar:get-settings", async () => {
     return getConfig().calendar;
   });
+}
+function initializeCalendarAutoSync() {
   const config2 = getConfig();
   if (config2.calendar.syncEnabled && config2.calendar.icsUrl) {
     startAutoSync();
@@ -3523,9 +3590,15 @@ function startAutoSync() {
     const currentConfig = getConfig();
     if (currentConfig.calendar.icsUrl) {
       try {
-        await syncCalendar(currentConfig.calendar.icsUrl);
+        const result = await syncCalendar(currentConfig.calendar.icsUrl);
+        if (!result.success) {
+          const { emitActivityLog: emitActivityLog2 } = await Promise.resolve().then(() => activityLog);
+          emitActivityLog2("warning", "Background calendar sync failed", result.error ?? "Unknown error");
+        }
       } catch (err) {
         console.error("Calendar sync failed:", err);
+        const { emitActivityLog: emitActivityLog2 } = await Promise.resolve().then(() => activityLog);
+        emitActivityLog2("error", "Background calendar sync crashed", err instanceof Error ? err.message : "Unknown error");
       }
     }
   }, intervalMs);
@@ -4071,8 +4144,7 @@ let ollamaInstance = null;
 function getOllamaService() {
   if (!ollamaInstance) {
     try {
-      const { getConfig: getConfig2 } = require("./config");
-      const config2 = getConfig2();
+      const config2 = getConfig();
       const baseUrl = config2.embeddings?.ollamaBaseUrl || DEFAULT_OLLAMA_BASE_URL;
       const embeddingModel = config2.embeddings?.ollamaModel || DEFAULT_EMBEDDING_MODEL;
       const chatModel = config2.chat?.ollamaModel || DEFAULT_CHAT_MODEL;
@@ -4308,9 +4380,12 @@ function getVectorStore() {
   return vectorStoreInstance;
 }
 const readFileAsync = util.promisify(fs.readFile);
+const unlinkAsync = util.promisify(fs.unlink);
+const execFileAsync = util.promisify(child_process.execFile);
 let mainWindow$1 = null;
 let isProcessing = false;
 let processingInterval = null;
+let lastSkipLogAt = 0;
 function setMainWindowForTranscription(win) {
   mainWindow$1 = win;
 }
@@ -4334,6 +4409,10 @@ function stopTranscriptionProcessor() {
   }
 }
 let cancelRequested = false;
+const MAX_INLINE_AUDIO_BYTES = 20 * 1024 * 1024;
+const TRANSCRIPTION_AUDIO_SAMPLE_RATE = 16e3;
+const TRANSCRIPTION_AUDIO_BITRATE = 16e3;
+const TRANSCODE_TIMEOUT_MS = 5 * 60 * 1e3;
 function cancelTranscription(recordingId) {
   removeFromQueueByRecordingId(recordingId);
   updateRecordingTranscriptionStatus(recordingId, "none");
@@ -4351,7 +4430,11 @@ async function processQueue() {
   const processId = `proc_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`;
   const lockAcquired = acquireTranscriptionLock(processId);
   if (!lockAcquired) {
-    console.log("[Transcription] Another process is already processing the queue, skipping");
+    const now = Date.now();
+    if (now - lastSkipLogAt > 6e4) {
+      console.log("[Transcription] Another process is already processing the queue, skipping");
+      lastSkipLogAt = now;
+    }
     return;
   }
   const config2 = getConfig();
@@ -4418,10 +4501,10 @@ async function processQueue() {
         updateQueueItem(item.id, "processing");
         updateQueueProgress(item.id, 0);
         notifyRenderer("transcription:started", { queueItemId: item.id, recordingId: item.recording_id });
-        const { emitActivityLog } = await Promise.resolve().then(() => require("./chunks/activity-log-D93aD6mA.js"));
+        const { emitActivityLog: emitActivityLog2 } = await Promise.resolve().then(() => activityLog);
         const recording = getRecordingById(item.recording_id);
         const filename = recording?.filename ?? item.recording_id;
-        emitActivityLog("info", "Transcribing recording", filename);
+        emitActivityLog2("info", "Transcribing recording", filename);
         let tickerProgress = 0;
         const progressTicker = setInterval(() => {
           if (tickerProgress < 90) {
@@ -4453,7 +4536,7 @@ async function processQueue() {
         updateQueueProgress(item.id, 100);
         updateQueueItem(item.id, "completed");
         notifyRenderer("transcription:completed", { queueItemId: item.id, recordingId: item.recording_id });
-        const { emitActivityLog: emitDone } = await Promise.resolve().then(() => require("./chunks/activity-log-D93aD6mA.js"));
+        const { emitActivityLog: emitDone } = await Promise.resolve().then(() => activityLog);
         const recDone = getRecordingById(item.recording_id);
         emitDone("success", "Transcription complete", recDone?.filename ?? item.recording_id);
       } catch (error2) {
@@ -4466,7 +4549,7 @@ async function processQueue() {
           recordingId: item.recording_id,
           error: errorMessage
         });
-        const { emitActivityLog: emitFail } = await Promise.resolve().then(() => require("./chunks/activity-log-D93aD6mA.js"));
+        const { emitActivityLog: emitFail } = await Promise.resolve().then(() => activityLog);
         const recFail = getRecordingById(item.recording_id);
         emitFail("error", "Transcription failed", `${recFail?.filename ?? item.recording_id}: ${errorMessage}`);
         const retryCount = item.retry_count ?? 0;
@@ -4542,6 +4625,126 @@ Only include detections with confidence >= 0.6.`;
     return [];
   }
 }
+function getAudioMimeType(filePath) {
+  const ext = path.extname(filePath).toLowerCase();
+  const mimeTypes = {
+    ".wav": "audio/wav",
+    ".mp3": "audio/mpeg",
+    ".m4a": "audio/mp4",
+    ".ogg": "audio/ogg",
+    ".webm": "audio/webm",
+    ".hda": "audio/mpeg"
+  };
+  return mimeTypes[ext] || "audio/wav";
+}
+async function tryTranscodeWithFfmpeg(inputPath, outputPath) {
+  const ffmpegCandidates = ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "ffmpeg"];
+  let lastError = null;
+  for (const candidate of ffmpegCandidates) {
+    if (candidate.includes("/") && !fs.existsSync(candidate)) {
+      continue;
+    }
+    try {
+      await execFileAsync(candidate, [
+        "-y",
+        "-i",
+        inputPath,
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        `${TRANSCRIPTION_AUDIO_SAMPLE_RATE}`,
+        "-c:a",
+        "aac",
+        "-b:a",
+        `${TRANSCRIPTION_AUDIO_BITRATE}`,
+        outputPath
+      ], {
+        timeout: TRANSCODE_TIMEOUT_MS,
+        maxBuffer: 8 * 1024 * 1024
+      });
+      return;
+    } catch (error2) {
+      lastError = error2;
+      if (error2?.code === "ENOENT") {
+        continue;
+      }
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error("ffmpeg is not available for audio transcoding");
+}
+async function transcodeAudioForGemini(inputPath) {
+  const outputPath = path.join(os.tmpdir(), `hidock-transcription-${crypto$1.randomUUID()}.m4a`);
+  try {
+    try {
+      await tryTranscodeWithFfmpeg(inputPath, outputPath);
+    } catch (ffmpegError) {
+      await execFileAsync("/usr/bin/afconvert", [
+        "-f",
+        "m4af",
+        "-d",
+        `aac@${TRANSCRIPTION_AUDIO_SAMPLE_RATE}`,
+        "-c",
+        "1",
+        "-b",
+        `${TRANSCRIPTION_AUDIO_BITRATE}`,
+        inputPath,
+        outputPath
+      ], {
+        timeout: TRANSCODE_TIMEOUT_MS,
+        maxBuffer: 8 * 1024 * 1024
+      });
+      if (ffmpegError) {
+        console.warn("[Transcription] ffmpeg unavailable, used afconvert fallback");
+      }
+    }
+    return {
+      filePath: outputPath,
+      sizeBytes: fs.statSync(outputPath).size
+    };
+  } catch (error2) {
+    try {
+      if (fs.existsSync(outputPath)) {
+        await unlinkAsync(outputPath);
+      }
+    } catch {
+    }
+    throw error2;
+  }
+}
+async function prepareAudioForTranscription(sourcePath) {
+  const sourceSize = fs.statSync(sourcePath).size;
+  if (sourceSize <= MAX_INLINE_AUDIO_BYTES) {
+    return {
+      filePath: sourcePath,
+      mimeType: getAudioMimeType(sourcePath),
+      sizeBytes: sourceSize,
+      transcoded: false
+    };
+  }
+  console.log(`[Transcription] Compressing large audio before upload: ${Math.round(sourceSize / 1024 / 1024)} MB`);
+  const compressed = await transcodeAudioForGemini(sourcePath);
+  if (compressed.sizeBytes > MAX_INLINE_AUDIO_BYTES) {
+    try {
+      await unlinkAsync(compressed.filePath);
+    } catch {
+    }
+    throw new Error(
+      `Recording is too large to transcribe automatically after compression (${Math.round(compressed.sizeBytes / 1024 / 1024)} MB). Please split it into smaller recordings.`
+    );
+  }
+  return {
+    filePath: compressed.filePath,
+    mimeType: "audio/mp4",
+    sizeBytes: compressed.sizeBytes,
+    transcoded: true,
+    cleanup: async () => {
+      if (fs.existsSync(compressed.filePath)) {
+        await unlinkAsync(compressed.filePath);
+      }
+    }
+  };
+}
 async function transcribeRecording(recordingId, progressCallback) {
   const recording = getRecordingById(recordingId);
   if (!recording || !recording.file_path) {
@@ -4556,27 +4759,19 @@ async function transcribeRecording(recordingId, progressCallback) {
   }
   console.log(`Transcribing: ${recording.filename}`);
   updateRecordingTranscriptionStatus(recordingId, "processing");
-  progressCallback?.("reading_file", 5);
-  const audioBuffer = await readFileAsync(recording.file_path);
-  const base64Audio = audioBuffer.toString("base64");
-  const ext = path.extname(recording.file_path).toLowerCase();
-  const mimeTypes = {
-    ".wav": "audio/wav",
-    ".mp3": "audio/mp3",
-    ".m4a": "audio/mp4",
-    ".ogg": "audio/ogg",
-    ".webm": "audio/webm",
-    ".hda": "audio/mp3"
-    // HiDock H1E outputs MPEG MP3 format
-  };
-  const mimeType = mimeTypes[ext] || "audio/wav";
-  const genAI = new generativeAi.GoogleGenerativeAI(config2.transcription.geminiApiKey);
-  const model = genAI.getGenerativeModel({ model: config2.transcription.geminiModel || "gemini-2.0-flash-exp" });
-  const candidateMeetings = findCandidateMeetingsForRecording(recordingId);
-  console.log(`Found ${candidateMeetings.length} candidate meetings for recording ${recordingId}`);
-  let meetingContext = "";
-  if (candidateMeetings.length > 0) {
-    meetingContext = `
+  progressCallback?.("preparing_audio", 5);
+  const preparedAudio = await prepareAudioForTranscription(recording.file_path);
+  try {
+    progressCallback?.("reading_file", 10);
+    const audioBuffer = await readFileAsync(preparedAudio.filePath);
+    const base64Audio = audioBuffer.toString("base64");
+    const genAI = new generativeAi.GoogleGenerativeAI(config2.transcription.geminiApiKey);
+    const model = genAI.getGenerativeModel({ model: config2.transcription.geminiModel || "gemini-2.0-flash-exp" });
+    const candidateMeetings = findCandidateMeetingsForRecording(recordingId);
+    console.log(`Found ${candidateMeetings.length} candidate meetings for recording ${recordingId}`);
+    let meetingContext = "";
+    if (candidateMeetings.length > 0) {
+      meetingContext = `
 
 POSSIBLE MEETING CONTEXT (use this to improve transcription accuracy):
 ${candidateMeetings.map((m, i) => `
@@ -4586,28 +4781,28 @@ Meeting ${i + 1}: "${m.subject}"
   ${m.location ? `Location: ${m.location}` : ""}
   ${m.description ? `Description: ${m.description.slice(0, 200)}...` : ""}
 `).join("\n")}`;
-  }
-  progressCallback?.("transcribing", 20);
-  const transcriptionPrompt = `Transcribe this audio recording.
+    }
+    progressCallback?.("transcribing", 20);
+    const transcriptionPrompt = `Transcribe this audio recording.
 The audio may be in Spanish or English - transcribe in the original language.
 Provide a clean, accurate transcription of all speech.
 If there are multiple speakers, try to indicate speaker changes with "Speaker 1:", "Speaker 2:", etc.
 ${meetingContext}
 Return ONLY the transcription, no additional commentary.`;
-  const transcriptionResult = await model.generateContent([
-    {
-      inlineData: {
-        mimeType,
-        data: base64Audio
-      }
-    },
-    { text: transcriptionPrompt }
-  ]);
-  const fullText = transcriptionResult.response.text();
-  progressCallback?.("analyzing", 50);
-  let meetingSelectionSection = "";
-  if (candidateMeetings.length > 1) {
-    meetingSelectionSection = `
+    const transcriptionResult = await model.generateContent([
+      {
+        inlineData: {
+          mimeType: preparedAudio.mimeType,
+          data: base64Audio
+        }
+      },
+      { text: transcriptionPrompt }
+    ]);
+    const fullText = transcriptionResult.response.text();
+    progressCallback?.("analyzing", 50);
+    let meetingSelectionSection = "";
+    if (candidateMeetings.length > 1) {
+      meetingSelectionSection = `
 5. IMPORTANT - Meeting Selection: Based on the transcript content, determine which meeting this recording most likely belongs to.
    Analyze mentions of topics, people, projects, or context clues to select the best match.
 
@@ -4618,15 +4813,15 @@ ${candidateMeetings.map((m, i) => `   ${i + 1}. "${m.subject}" (ID: ${m.id})`).j
    "selected_meeting_id": "the meeting ID that best matches",
    "meeting_confidence": 0.0 to 1.0 (how confident you are),
    "selection_reason": "why you selected this meeting"`;
-  } else if (candidateMeetings.length === 1) {
-    meetingSelectionSection = `
+    } else if (candidateMeetings.length === 1) {
+      meetingSelectionSection = `
 5. Meeting Match: This recording appears to be from the meeting "${candidateMeetings[0].subject}".
    Verify this makes sense based on the content.
    "selected_meeting_id": "${candidateMeetings[0].id}",
    "meeting_confidence": 0.0 to 1.0,
    "selection_reason": "your reasoning"`;
-  }
-  const analysisPrompt = `Analyze this meeting transcript and provide:
+    }
+    const analysisPrompt = `Analyze this meeting transcript and provide:
 1. A brief summary (2-3 sentences)
 2. A list of action items mentioned (as a JSON array of strings)
 3. Key topics discussed (as a JSON array of strings)
@@ -4654,120 +4849,125 @@ Respond in JSON format:
   "meeting_confidence": 0.0,
   "selection_reason": "..."` : ""}
 }`;
-  const analysisResult = await model.generateContent(analysisPrompt);
-  const analysisText = analysisResult.response.text();
-  let analysis = {};
-  try {
-    const jsonMatch = analysisText.match(/\{[\s\S]*\}/);
-    if (jsonMatch) {
-      analysis = JSON.parse(jsonMatch[0]);
+    const analysisResult = await model.generateContent(analysisPrompt);
+    const analysisText = analysisResult.response.text();
+    let analysis = {};
+    try {
+      const jsonMatch = analysisText.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        analysis = JSON.parse(jsonMatch[0]);
+      }
+    } catch (e) {
+      console.warn("Failed to parse analysis JSON:", e);
+      analysis = { summary: "Analysis failed", language: "unknown" };
     }
-  } catch (e) {
-    console.warn("Failed to parse analysis JSON:", e);
-    analysis = { summary: "Analysis failed", language: "unknown" };
-  }
-  if (candidateMeetings.length > 0) {
-    for (const meeting of candidateMeetings) {
-      const isSelected = analysis.selected_meeting_id === meeting.id;
-      const confidence = isSelected ? analysis.meeting_confidence || 0.5 : 0.1;
-      const reason = isSelected ? analysis.selection_reason || "Time overlap" : "Time overlap only";
-      addRecordingMeetingCandidate(recordingId, meeting.id, confidence, reason, isSelected);
-    }
-    if (analysis.selected_meeting_id) {
-      const selectedMeeting = candidateMeetings.find((m) => m.id === analysis.selected_meeting_id);
-      if (selectedMeeting) {
-        linkRecordingToMeeting(
-          recordingId,
-          selectedMeeting.id,
-          analysis.meeting_confidence || 0.5,
-          "ai_transcript_match"
-        );
-        console.log(`AI matched recording to meeting: "${selectedMeeting.subject}" (confidence: ${analysis.meeting_confidence})`);
+    if (candidateMeetings.length > 0) {
+      for (const meeting of candidateMeetings) {
+        const isSelected = analysis.selected_meeting_id === meeting.id;
+        const confidence = isSelected ? analysis.meeting_confidence || 0.5 : 0.1;
+        const reason = isSelected ? analysis.selection_reason || "Time overlap" : "Time overlap only";
+        addRecordingMeetingCandidate(recordingId, meeting.id, confidence, reason, isSelected);
+      }
+      if (analysis.selected_meeting_id) {
+        const selectedMeeting = candidateMeetings.find((m) => m.id === analysis.selected_meeting_id);
+        if (selectedMeeting) {
+          linkRecordingToMeeting(
+            recordingId,
+            selectedMeeting.id,
+            analysis.meeting_confidence || 0.5,
+            "ai_transcript_match"
+          );
+          console.log(`AI matched recording to meeting: "${selectedMeeting.subject}" (confidence: ${analysis.meeting_confidence})`);
+        }
       }
     }
-  }
-  const wordCount = fullText.split(/\s+/).filter((w) => w.length > 0).length;
-  const transcript = {
-    id: `trans_${recordingId}`,
-    recording_id: recordingId,
-    full_text: fullText,
-    language: analysis.language || "unknown",
-    summary: analysis.summary,
-    action_items: analysis.action_items ? JSON.stringify(analysis.action_items) : void 0,
-    topics: analysis.topics ? JSON.stringify(analysis.topics) : void 0,
-    key_points: analysis.key_points ? JSON.stringify(analysis.key_points) : void 0,
-    word_count: wordCount,
-    transcription_provider: "gemini",
-    transcription_model: config2.transcription.geminiModel,
-    title_suggestion: analysis.title_suggestion,
-    question_suggestions: analysis.question_suggestions ? JSON.stringify(analysis.question_suggestions) : void 0
-  };
-  insertTranscript(transcript);
-  updateRecordingTranscriptionStatus(recordingId, "complete");
-  if (analysis.title_suggestion) {
-    updateKnowledgeCaptureTitle(recordingId, analysis.title_suggestion);
-  }
-  progressCallback?.("detecting_actionables", 75);
-  try {
-    const knowledgeCapture = queryOne(
-      "SELECT id FROM knowledge_captures WHERE source_recording_id = ?",
-      [recordingId]
-    );
-    const sourceKnowledgeId = knowledgeCapture?.id || recordingId;
-    const detections = await detectActionables(fullText, sourceKnowledgeId, {
-      title: analysis.title_suggestion,
-      questions: analysis.question_suggestions
-    });
-    const VALID_TEMPLATE_IDS = ["meeting_minutes", "interview_feedback", "project_status", "action_items"];
-    for (const detection of detections) {
-      const actionableId = `act_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-      const sanitizedTemplate = detection.suggestedTemplate && VALID_TEMPLATE_IDS.includes(detection.suggestedTemplate) ? detection.suggestedTemplate : "meeting_minutes";
-      run(
-        `INSERT INTO actionables (
+    const wordCount = fullText.split(/\s+/).filter((w) => w.length > 0).length;
+    const transcript = {
+      id: `trans_${recordingId}`,
+      recording_id: recordingId,
+      full_text: fullText,
+      language: analysis.language || "unknown",
+      summary: analysis.summary,
+      action_items: analysis.action_items ? JSON.stringify(analysis.action_items) : void 0,
+      topics: analysis.topics ? JSON.stringify(analysis.topics) : void 0,
+      key_points: analysis.key_points ? JSON.stringify(analysis.key_points) : void 0,
+      sentiment: void 0,
+      speakers: void 0,
+      word_count: wordCount,
+      transcription_provider: "gemini",
+      transcription_model: config2.transcription.geminiModel,
+      title_suggestion: analysis.title_suggestion,
+      question_suggestions: analysis.question_suggestions ? JSON.stringify(analysis.question_suggestions) : void 0
+    };
+    insertTranscript(transcript);
+    updateRecordingTranscriptionStatus(recordingId, "complete");
+    if (analysis.title_suggestion) {
+      updateKnowledgeCaptureTitle(recordingId, analysis.title_suggestion);
+    }
+    progressCallback?.("detecting_actionables", 75);
+    try {
+      const knowledgeCapture = queryOne(
+        "SELECT id FROM knowledge_captures WHERE source_recording_id = ?",
+        [recordingId]
+      );
+      const sourceKnowledgeId = knowledgeCapture?.id || recordingId;
+      const detections = await detectActionables(fullText, sourceKnowledgeId, {
+        title: analysis.title_suggestion,
+        questions: analysis.question_suggestions
+      });
+      const VALID_TEMPLATE_IDS = ["meeting_minutes", "interview_feedback", "project_status", "action_items"];
+      for (const detection of detections) {
+        const actionableId = `act_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+        const sanitizedTemplate = detection.suggestedTemplate && VALID_TEMPLATE_IDS.includes(detection.suggestedTemplate) ? detection.suggestedTemplate : "meeting_minutes";
+        run(
+          `INSERT INTO actionables (
           id, source_knowledge_id, type, title, description, status,
           confidence, suggested_template, created_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [
-          actionableId,
-          sourceKnowledgeId,
-          // source_knowledge_id references knowledge_captures.id
-          detection.type,
-          detection.suggestedTitle,
-          detection.reason,
-          "pending",
-          detection.confidence,
-          sanitizedTemplate,
-          (/* @__PURE__ */ new Date()).toISOString()
-        ]
-      );
+          [
+            actionableId,
+            sourceKnowledgeId,
+            // source_knowledge_id references knowledge_captures.id
+            detection.type,
+            detection.suggestedTitle,
+            detection.reason,
+            "pending",
+            detection.confidence,
+            sanitizedTemplate,
+            (/* @__PURE__ */ new Date()).toISOString()
+          ]
+        );
+      }
+      if (detections.length > 0) {
+        console.log(`[Actionable Detection] Created ${detections.length} actionables for ${recordingId}`);
+      }
+    } catch (error2) {
+      console.error("[Actionable Detection] Failed to create actionables:", error2);
     }
-    if (detections.length > 0) {
-      console.log(`[Actionable Detection] Created ${detections.length} actionables for ${recordingId}`);
+    progressCallback?.("indexing", 85);
+    try {
+      const vectorStore = getVectorStore();
+      const meetingId = analysis.selected_meeting_id || recording.meeting_id;
+      let meetingSubject;
+      if (meetingId) {
+        const meeting = getMeetingById(meetingId);
+        meetingSubject = meeting?.subject;
+      }
+      const indexedCount = await vectorStore.indexTranscript(fullText, {
+        meetingId: meetingId || void 0,
+        recordingId,
+        timestamp: recording.created_at,
+        subject: meetingSubject
+      });
+      console.log(`Indexed ${indexedCount} chunks into vector store`);
+    } catch (e) {
+      console.warn("Failed to index transcript into vector store:", e);
     }
-  } catch (error2) {
-    console.error("[Actionable Detection] Failed to create actionables:", error2);
+    progressCallback?.("complete", 100);
+    console.log(`Transcription complete: ${recording.filename} (${wordCount} words)`);
+  } finally {
+    await preparedAudio.cleanup?.();
   }
-  progressCallback?.("indexing", 85);
-  try {
-    const vectorStore = getVectorStore();
-    const meetingId = analysis.selected_meeting_id || recording.meeting_id;
-    let meetingSubject;
-    if (meetingId) {
-      const meeting = getMeetingById(meetingId);
-      meetingSubject = meeting?.subject;
-    }
-    const indexedCount = await vectorStore.indexTranscript(fullText, {
-      meetingId: meetingId || void 0,
-      recordingId,
-      timestamp: recording.created_at,
-      subject: meetingSubject
-    });
-    console.log(`Indexed ${indexedCount} chunks into vector store`);
-  } catch (e) {
-    console.warn("Failed to index transcript into vector store:", e);
-  }
-  progressCallback?.("complete", 100);
-  console.log(`Transcription complete: ${recording.filename} (${wordCount} words)`);
 }
 async function transcribeManually(recordingId) {
   try {
@@ -4799,6 +4999,7 @@ const transcription = /* @__PURE__ */ Object.freeze(/* @__PURE__ */ Object.defin
   cancelAllTranscriptions,
   cancelTranscription,
   getTranscriptionStatus,
+  prepareAudioForTranscription,
   processQueueManually,
   setMainWindowForTranscription,
   startTranscriptionProcessor,
@@ -5042,24 +5243,26 @@ function registerRecordingHandlers() {
       const result = GetRecordingByIdSchema.safeParse({ id: recordingId });
       if (!result.success) {
         console.error("recordings:getCandidates validation error:", result.error);
-        return [];
+        return { success: false, data: [], error: "Invalid recording ID" };
       }
-      return getCandidatesForRecordingWithDetails(result.data.id);
+      const data = getCandidatesForRecordingWithDetails(result.data.id);
+      return { success: true, data };
     } catch (error2) {
       console.error("recordings:getCandidates error:", error2);
-      return [];
+      return { success: false, data: [], error: error2 instanceof Error ? error2.message : "Unknown error" };
     }
   });
   electron.ipcMain.handle("recordings:getMeetingsNearDate", async (_, dateStr) => {
     try {
       if (typeof dateStr !== "string") {
         console.error("recordings:getMeetingsNearDate invalid date:", dateStr);
-        return [];
+        return { success: false, data: [], error: "Invalid date" };
       }
-      return getMeetingsNearDate(dateStr);
+      const data = getMeetingsNearDate(dateStr);
+      return { success: true, data };
     } catch (error2) {
       console.error("recordings:getMeetingsNearDate error:", error2);
-      return [];
+      return { success: false, data: [], error: error2 instanceof Error ? error2.message : "Unknown error" };
     }
   });
   electron.ipcMain.handle("recordings:addExternal", async () => {
@@ -8592,6 +8795,16 @@ class DownloadService {
       this.persistQueueItem(item);
       this.markDirty();
       this.emitStateUpdate(true);
+      if (item.fileSize && item.fileSize > 0 && data.length !== item.fileSize) {
+        const errMsg = `File size mismatch: expected ${item.fileSize} bytes, received ${data.length} bytes`;
+        console.error(`[DownloadService] Integrity check failed: ${filename} — ${errMsg}`);
+        item.status = "failed";
+        item.error = errMsg;
+        this.persistQueueItem(item);
+        this.markDirty();
+        this.emitStateUpdate(true);
+        return { success: false, error: errMsg };
+      }
       const filePath = await saveRecording(filename, data, void 0, item.recordingDate);
       const wavFilename = filename.replace(/\.hda$/i, ".wav");
       addSyncedFile(filename, path.basename(filePath), filePath, data.length);
@@ -8648,6 +8861,7 @@ class DownloadService {
     item.status = "cancelled";
     item.error = "Cancelled by user";
     this.persistQueueItem(item);
+    emitActivityLog("info", `Download cancelled: ${filename}`);
     console.log(`[DownloadService] Cancelled download: ${filename}`);
     this.markDirty();
     this.emitStateUpdate(true);
@@ -8691,6 +8905,7 @@ class DownloadService {
       item.status = "failed";
       item.error = error2;
       this.persistQueueItem(item);
+      emitActivityLog("error", `Download failed: ${filename}`, error2);
       if (this.state.currentSession) {
         this.state.currentSession.failedFiles++;
       }
@@ -8730,10 +8945,12 @@ class DownloadService {
           stallTimeout = STALL_TIMEOUT_DEFAULT_MS;
         }
         if (elapsed > stallTimeout) {
+          const stallMsg = `Download stalled (${Math.round(elapsed / 1e3)}s without data)`;
           console.warn(`[DownloadService] Stall detected for ${item.filename} (${Math.round(elapsed / 1e3)}s without progress, timeout=${stallTimeout / 1e3}s, size=${item.fileSize})`);
           item.status = "failed";
-          item.error = `Download stalled (${Math.round(elapsed / 1e3)}s without data)`;
+          item.error = stallMsg;
           this.persistQueueItem(item);
+          emitActivityLog("warning", `Download stalled: ${item.filename}`, stallMsg);
           if (this.state.currentSession) {
             this.state.currentSession.failedFiles++;
           }
@@ -8902,6 +9119,7 @@ class DownloadService {
             this.persistQueueItem(item);
           }
         });
+        emitActivityLog("info", "All downloads cancelled", `${itemsToCancel.length} items`);
       }
       if (this.state.currentSession) {
         this.state.currentSession.status = "cancelled";
@@ -10647,6 +10865,7 @@ async function initializeServices() {
   console.log("Storage policy service initialized");
   registerIpcHandlers();
   console.log("IPC handlers registered");
+  initializeCalendarAutoSync();
   updateSplashStatus("Starting application...", 100);
 }
 electron.app.commandLine.appendSwitch("disable-usb-blocklist");
@@ -10701,24 +10920,39 @@ electron.app.whenReady().then(async () => {
     console.log("[USB] Protected classes request received");
     return [];
   });
-  await initializeServices();
-  createWindow();
-  if (mainWindow) {
-    setMainWindow(mainWindow);
-    setMainWindowForTranscription(mainWindow);
-    setMainWindowForEventBus(mainWindow);
-    setMainWindowForMigration(mainWindow);
-  }
-  startRecordingWatcher();
-  startTranscriptionProcessor();
-  console.log("Background services started");
-  if (!is.dev && process.env.ENABLE_REMOTE_DEBUGGING === "true" && mainWindow) {
-    mainWindow.webContents.on("did-finish-load", () => {
-      mainWindow?.webContents.send("security-warning", {
-        type: "remote-debugging-enabled",
-        message: "Remote debugging is enabled. This should only be used for troubleshooting."
+  try {
+    await initializeServices();
+    createWindow();
+    if (mainWindow) {
+      setMainWindow(mainWindow);
+      setMainWindowForTranscription(mainWindow);
+      setMainWindowForEventBus(mainWindow);
+      setMainWindowForMigration(mainWindow);
+    }
+    startRecordingWatcher();
+    startTranscriptionProcessor();
+    console.log("Background services started");
+    if (!is.dev && process.env.ENABLE_REMOTE_DEBUGGING === "true" && mainWindow) {
+      mainWindow.webContents.on("did-finish-load", () => {
+        mainWindow?.webContents.send("security-warning", {
+          type: "remote-debugging-enabled",
+          message: "Remote debugging is enabled. This should only be used for troubleshooting."
+        });
       });
-    });
+    }
+  } catch (error2) {
+    const message = error2 instanceof Error ? error2.message : String(error2);
+    console.error("[Startup] Failed to initialize application:", error2);
+    updateSplashStatus(`Startup failed: ${message}`);
+    closeSplash();
+    electron.dialog.showErrorBox(
+      "HiDock failed to start",
+      `Application startup stopped during initialization.
+
+${message}`
+    );
+    electron.app.quit();
+    return;
   }
   electron.app.on("activate", function() {
     if (electron.BrowserWindow.getAllWindows().length === 0) createWindow();

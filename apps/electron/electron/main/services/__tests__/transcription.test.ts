@@ -18,6 +18,9 @@ const mockUpdateRecordingStatus = vi.fn()
 const mockUpdateQueueItem = vi.fn()
 const mockGetQueueItems = vi.fn()
 const mockGetRecordingById = vi.fn()
+const mockStatSync = vi.fn()
+const mockUnlink = vi.fn()
+const mockExecFile = vi.fn()
 
 // Mock database
 vi.mock('../database', () => ({
@@ -75,11 +78,17 @@ vi.mock('fs', async (importOriginal) => {
   return {
     ...actual,
     existsSync: vi.fn(() => true),
+    statSync: (...args: any[]) => mockStatSync(...args),
     readFile: vi.fn((_path: string, cb: (err: null, data: Buffer) => void) => {
       cb(null, Buffer.from('fake audio data'))
-    })
+    }),
+    unlink: (...args: any[]) => mockUnlink(...args)
   }
 })
+
+vi.mock('child_process', () => ({
+  execFile: (...args: any[]) => mockExecFile(...args)
+}))
 
 // Mock vector store
 vi.mock('../vector-store', () => ({
@@ -89,6 +98,45 @@ vi.mock('../vector-store', () => ({
 describe('Transcription Service', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    mockStatSync.mockImplementation((target: string) => ({
+      size: target.endsWith('.m4a') ? 4 * 1024 * 1024 : 1024
+    }))
+    mockUnlink.mockImplementation((_path: string, cb: (err: null) => void) => cb(null))
+    mockExecFile.mockImplementation((_cmd: string, _args: string[], optsOrCb: any, maybeCb?: any) => {
+      const cb = typeof optsOrCb === 'function' ? optsOrCb : maybeCb
+      cb(null, '', '')
+    })
+  })
+
+  describe('prepareAudioForTranscription', () => {
+    it('should reuse small files without transcoding', async () => {
+      const { prepareAudioForTranscription } = await import('../transcription')
+
+      const prepared = await prepareAudioForTranscription('/recordings/test.wav')
+
+      expect(prepared.transcoded).toBe(false)
+      expect(prepared.filePath).toBe('/recordings/test.wav')
+      expect(prepared.mimeType).toBe('audio/wav')
+      expect(mockExecFile).not.toHaveBeenCalled()
+    })
+
+    it('should transcode large files before inline upload and clean up temp files', async () => {
+      mockStatSync.mockImplementation((target: string) => ({
+        size: target.endsWith('.m4a') ? 4 * 1024 * 1024 : 25 * 1024 * 1024
+      }))
+
+      const { prepareAudioForTranscription } = await import('../transcription')
+
+      const prepared = await prepareAudioForTranscription('/recordings/large.wav')
+
+      expect(prepared.transcoded).toBe(true)
+      expect(prepared.mimeType).toBe('audio/mp4')
+      expect(prepared.filePath).toContain('hidock-transcription-')
+      expect(mockExecFile).toHaveBeenCalled()
+
+      await prepared.cleanup?.()
+      expect(mockUnlink).toHaveBeenCalled()
+    })
   })
 
   describe('BUG-TX-001: recordings.status stuck at transcribing after failure', () => {

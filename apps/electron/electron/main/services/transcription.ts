@@ -1,9 +1,14 @@
 import { GoogleGenerativeAI } from '@google/generative-ai'
-import { readFile, existsSync } from 'fs'
+import { readFile, existsSync, statSync, unlink } from 'fs'
+import { execFile } from 'child_process'
+import { randomUUID } from 'crypto'
+import { tmpdir } from 'os'
+import { extname, join } from 'path'
 import { promisify } from 'util'
-import { extname } from 'path'
 
 const readFileAsync = promisify(readFile)
+const unlinkAsync = promisify(unlink)
+const execFileAsync = promisify(execFile)
 import { getConfig } from './config'
 import {
   getRecordingById,
@@ -69,6 +74,10 @@ export function stopTranscriptionProcessor(): void {
 }
 
 let cancelRequested = false
+const MAX_INLINE_AUDIO_BYTES = 20 * 1024 * 1024
+const TRANSCRIPTION_AUDIO_SAMPLE_RATE = 16000
+const TRANSCRIPTION_AUDIO_BITRATE = 16000
+const TRANSCODE_TIMEOUT_MS = 5 * 60 * 1000
 
 export function cancelTranscription(recordingId: string): void {
   removeFromQueueByRecordingId(recordingId)
@@ -364,6 +373,151 @@ Only include detections with confidence >= 0.6.`
   }
 }
 
+interface PreparedAudioPayload {
+  filePath: string
+  mimeType: string
+  sizeBytes: number
+  transcoded: boolean
+  cleanup?: () => Promise<void>
+}
+
+function getAudioMimeType(filePath: string): string {
+  const ext = extname(filePath).toLowerCase()
+  const mimeTypes: Record<string, string> = {
+    '.wav': 'audio/wav',
+    '.mp3': 'audio/mpeg',
+    '.m4a': 'audio/mp4',
+    '.ogg': 'audio/ogg',
+    '.webm': 'audio/webm',
+    '.hda': 'audio/mpeg'
+  }
+  return mimeTypes[ext] || 'audio/wav'
+}
+
+async function tryTranscodeWithFfmpeg(inputPath: string, outputPath: string): Promise<void> {
+  const ffmpegCandidates = ['/opt/homebrew/bin/ffmpeg', '/usr/local/bin/ffmpeg', 'ffmpeg']
+  let lastError: unknown = null
+
+  for (const candidate of ffmpegCandidates) {
+    if (candidate.includes('/') && !existsSync(candidate)) {
+      continue
+    }
+
+    try {
+      await execFileAsync(candidate, [
+        '-y',
+        '-i',
+        inputPath,
+        '-vn',
+        '-ac',
+        '1',
+        '-ar',
+        `${TRANSCRIPTION_AUDIO_SAMPLE_RATE}`,
+        '-c:a',
+        'aac',
+        '-b:a',
+        `${TRANSCRIPTION_AUDIO_BITRATE}`,
+        outputPath
+      ], {
+        timeout: TRANSCODE_TIMEOUT_MS,
+        maxBuffer: 8 * 1024 * 1024
+      })
+      return
+    } catch (error) {
+      lastError = error
+      if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') {
+        continue
+      }
+    }
+  }
+
+  throw lastError instanceof Error
+    ? lastError
+    : new Error('ffmpeg is not available for audio transcoding')
+}
+
+async function transcodeAudioForGemini(inputPath: string): Promise<{ filePath: string; sizeBytes: number }> {
+  const outputPath = join(tmpdir(), `hidock-transcription-${randomUUID()}.m4a`)
+
+  try {
+    try {
+      await tryTranscodeWithFfmpeg(inputPath, outputPath)
+    } catch (ffmpegError) {
+      await execFileAsync('/usr/bin/afconvert', [
+        '-f',
+        'm4af',
+        '-d',
+        `aac@${TRANSCRIPTION_AUDIO_SAMPLE_RATE}`,
+        '-c',
+        '1',
+        '-b',
+        `${TRANSCRIPTION_AUDIO_BITRATE}`,
+        inputPath,
+        outputPath
+      ], {
+        timeout: TRANSCODE_TIMEOUT_MS,
+        maxBuffer: 8 * 1024 * 1024
+      })
+
+      if (ffmpegError) {
+        console.warn('[Transcription] ffmpeg unavailable, used afconvert fallback')
+      }
+    }
+
+    return {
+      filePath: outputPath,
+      sizeBytes: statSync(outputPath).size
+    }
+  } catch (error) {
+    try {
+      if (existsSync(outputPath)) {
+        await unlinkAsync(outputPath)
+      }
+    } catch {
+      // Best effort cleanup
+    }
+    throw error
+  }
+}
+
+export async function prepareAudioForTranscription(sourcePath: string): Promise<PreparedAudioPayload> {
+  const sourceSize = statSync(sourcePath).size
+  if (sourceSize <= MAX_INLINE_AUDIO_BYTES) {
+    return {
+      filePath: sourcePath,
+      mimeType: getAudioMimeType(sourcePath),
+      sizeBytes: sourceSize,
+      transcoded: false
+    }
+  }
+
+  console.log(`[Transcription] Compressing large audio before upload: ${Math.round(sourceSize / 1024 / 1024)} MB`)
+  const compressed = await transcodeAudioForGemini(sourcePath)
+
+  if (compressed.sizeBytes > MAX_INLINE_AUDIO_BYTES) {
+    try {
+      await unlinkAsync(compressed.filePath)
+    } catch {
+      // Best effort cleanup
+    }
+    throw new Error(
+      `Recording is too large to transcribe automatically after compression (${Math.round(compressed.sizeBytes / 1024 / 1024)} MB). Please split it into smaller recordings.`
+    )
+  }
+
+  return {
+    filePath: compressed.filePath,
+    mimeType: 'audio/mp4',
+    sizeBytes: compressed.sizeBytes,
+    transcoded: true,
+    cleanup: async () => {
+      if (existsSync(compressed.filePath)) {
+        await unlinkAsync(compressed.filePath)
+      }
+    }
+  }
+}
+
 async function transcribeRecording(
   recordingId: string,
   progressCallback?: (stage: string, progress: number) => void
@@ -386,23 +540,16 @@ async function transcribeRecording(
   // AI-13: Use standard enum values matching Recording.transcription_status
   updateRecordingTranscriptionStatus(recordingId, 'processing')
 
-  progressCallback?.('reading_file', 5) // spec-014: progress reporting
+  progressCallback?.('preparing_audio', 5)
+  const preparedAudio = await prepareAudioForTranscription(recording.file_path)
 
-  // Read the audio file asynchronously to avoid blocking the main process
-  const audioBuffer = await readFileAsync(recording.file_path)
-  const base64Audio = audioBuffer.toString('base64')
+  try {
+    progressCallback?.('reading_file', 10) // spec-014: progress reporting
 
-  // Determine MIME type
-  const ext = extname(recording.file_path).toLowerCase()
-  const mimeTypes: Record<string, string> = {
-    '.wav': 'audio/wav',
-    '.mp3': 'audio/mp3',
-    '.m4a': 'audio/mp4',
-    '.ogg': 'audio/ogg',
-    '.webm': 'audio/webm',
-    '.hda': 'audio/mp3' // HiDock H1E outputs MPEG MP3 format
-  }
-  const mimeType = mimeTypes[ext] || 'audio/wav'
+    // Read the prepared audio asynchronously to avoid blocking the main process.
+    // Large source files are transcoded first so we do not OOM while base64-encoding.
+    const audioBuffer = await readFileAsync(preparedAudio.filePath)
+    const base64Audio = audioBuffer.toString('base64')
 
   // Initialize Gemini
   const genAI = new GoogleGenerativeAI(config.transcription.geminiApiKey)
@@ -438,7 +585,7 @@ Return ONLY the transcription, no additional commentary.`
   const transcriptionResult = await model.generateContent([
     {
       inlineData: {
-        mimeType,
+        mimeType: preparedAudio.mimeType,
         data: base64Audio
       }
     },
@@ -668,6 +815,9 @@ Respond in JSON format:
 
   progressCallback?.('complete', 100) // spec-014: progress reporting
   console.log(`Transcription complete: ${recording.filename} (${wordCount} words)`)
+  } finally {
+    await preparedAudio.cleanup?.()
+  }
 }
 
 export async function transcribeManually(recordingId: string): Promise<void> {

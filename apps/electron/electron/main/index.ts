@@ -1,4 +1,4 @@
-import { app, shell, BrowserWindow, session, ipcMain } from 'electron'
+import { app, shell, BrowserWindow, session, ipcMain, dialog } from 'electron'
 import { join } from 'path'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 
@@ -249,31 +249,44 @@ app.whenReady().then(async () => {
     return []
   })
 
-  // Initialize all services before creating window (shows progress in splash)
-  await initializeServices()
+  try {
+    // Initialize all services before creating window (shows progress in splash)
+    await initializeServices()
 
-  createWindow()
+    createWindow()
 
-  if (mainWindow) {
-    setWatcherMainWindow(mainWindow)
-    setMainWindowForTranscription(mainWindow)
-    setMainWindowForEventBus(mainWindow)
-    setMainWindowForMigration(mainWindow)
-  }
+    if (mainWindow) {
+      setWatcherMainWindow(mainWindow)
+      setMainWindowForTranscription(mainWindow)
+      setMainWindowForEventBus(mainWindow)
+      setMainWindowForMigration(mainWindow)
+    }
 
-  startRecordingWatcher()
-  startTranscriptionProcessor()
-  console.log('Background services started')
+    startRecordingWatcher()
+    startTranscriptionProcessor()
+    console.log('Background services started')
 
-  // Show security warning in production when remote debugging is explicitly enabled
-  if (!is.dev && process.env.ENABLE_REMOTE_DEBUGGING === 'true' && mainWindow) {
-    // Wait for window to be ready before sending the warning
-    mainWindow.webContents.on('did-finish-load', () => {
-      mainWindow?.webContents.send('security-warning', {
-        type: 'remote-debugging-enabled',
-        message: 'Remote debugging is enabled. This should only be used for troubleshooting.'
+    // Show security warning in production when remote debugging is explicitly enabled
+    if (!is.dev && process.env.ENABLE_REMOTE_DEBUGGING === 'true' && mainWindow) {
+      // Wait for window to be ready before sending the warning
+      mainWindow.webContents.on('did-finish-load', () => {
+        mainWindow?.webContents.send('security-warning', {
+          type: 'remote-debugging-enabled',
+          message: 'Remote debugging is enabled. This should only be used for troubleshooting.'
+        })
       })
-    })
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    console.error('[Startup] Failed to initialize application:', error)
+    updateSplashStatus(`Startup failed: ${message}`)
+    closeSplash()
+    dialog.showErrorBox(
+      'HiDock failed to start',
+      `Application startup stopped during initialization.\n\n${message}`
+    )
+    app.quit()
+    return
   }
 
   app.on('activate', function () {

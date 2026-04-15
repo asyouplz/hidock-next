@@ -212,6 +212,38 @@ describe('Database Service', () => {
       expect(migrationInserts.length).toBeGreaterThanOrEqual(1)
     })
 
+    it('should create core tables before inspecting table_info pragmas', async () => {
+      const fs = await import('fs')
+      ;(fs.existsSync as any).mockReturnValue(false)
+
+      ;(mockDatabase.exec as any).mockImplementation((sql: string) => {
+        if (sql.includes('PRAGMA table_info(recordings)')) {
+          const hasCreatedRecordingsTable = mockDatabase.run.mock.calls.some(
+            (call: any[]) =>
+              typeof call[0] === 'string' &&
+              call[0].includes('CREATE TABLE IF NOT EXISTS recordings')
+          )
+
+          if (!hasCreatedRecordingsTable) {
+            throw new Error('recordings table inspected before creation')
+          }
+        }
+
+        if (sql.includes('PRAGMA table_info')) {
+          return FULL_COLUMNS_PRAGMA
+        }
+
+        if (sql.includes('schema_version')) {
+          return [{ values: [[21]] }]
+        }
+
+        return []
+      })
+
+      const dbModule = await import('../database')
+      await expect(dbModule.initializeDatabase()).resolves.toBeUndefined()
+    })
+
     it('should throw on fatal initialization error', async () => {
       const initSqlJs = (await import('sql.js')).default
       ;(initSqlJs as any).mockRejectedValueOnce(new Error('WASM load failed'))

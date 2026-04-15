@@ -1200,6 +1200,18 @@ const MIGRATIONS: Record<number, () => void> = {
 
 }
 
+function getExecutableSql(sql: string): string {
+  return sql
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0 && !line.startsWith('--'))
+    .join(' ')
+}
+
+function isCreateTableStatement(sql: string): boolean {
+  return getExecutableSql(sql).toUpperCase().startsWith('CREATE TABLE')
+}
+
 function runMigrations(currentVersion: number): void {
   for (let v = currentVersion + 1; v <= SCHEMA_VERSION; v++) {
     const migration = MIGRATIONS[v]
@@ -1238,7 +1250,7 @@ export async function initializeDatabase(): Promise<void> {
     // --- PHASE 1: CORE TABLES ---
     console.log('[Database] Phase 1: Ensuring core tables exist...')
     for (const sql of statements) {
-      if (sql.toUpperCase().startsWith('CREATE TABLE')) {
+      if (isCreateTableStatement(sql)) {
         try {
           database.run(sql)
         } catch (e) {
@@ -1253,7 +1265,7 @@ export async function initializeDatabase(): Promise<void> {
     
     // Repair Recordings
     const recordingsInfo = database.exec("PRAGMA table_info(recordings)")
-    const recCols = recordingsInfo[0].values.map(col => col[1])
+    const recCols = recordingsInfo[0]?.values?.map(col => col[1]) ?? []
     const recordingRepairs = [
       { name: 'migrated_to_capture_id', def: "TEXT" },
       { name: 'migration_status', def: "TEXT CHECK(migration_status IN ('pending', 'migrated', 'skipped', 'error')) DEFAULT 'pending'" },
@@ -1268,7 +1280,7 @@ export async function initializeDatabase(): Promise<void> {
 
     // Repair Knowledge Captures
     const captureInfo = database.exec("PRAGMA table_info(knowledge_captures)")
-    const capCols = captureInfo[0].values.map(col => col[1])
+    const capCols = captureInfo[0]?.values?.map(col => col[1]) ?? []
     const knowledgeRepairs = [
       { name: 'category', def: "category TEXT CHECK(category IN ('meeting', 'interview', '1:1', 'brainstorm', 'note', 'other')) DEFAULT 'meeting'" },
       { name: 'status', def: "status TEXT CHECK(status IN ('processing', 'ready', 'enriched')) DEFAULT 'ready'" },
