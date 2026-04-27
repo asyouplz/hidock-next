@@ -24,6 +24,7 @@ import { hasDeviceFile, type DeviceOnlyRecording, type BothLocationsRecording } 
 import { formatBytes, formatDuration } from '@/utils/formatters'
 import { useIsDownloading, useDownloadProgress } from '@/store/useAppStore'
 import { useUIStore } from '@/store/ui/useUIStore'
+import { useOperations } from '@/hooks/useOperations'
 
 type SortColumn = 'filename' | 'size' | 'duration' | 'dateRecorded'
 type SortDirection = 'asc' | 'desc'
@@ -56,7 +57,7 @@ interface DeviceFileRowProps {
   isPlaying: boolean
   selected: boolean
   onToggleSelect: (id: string) => void
-  onDownload: (filename: string, fileSize: number) => void
+  onDownload: (filename: string) => void
   onDeleteClick: (filename: string) => void
 }
 
@@ -71,8 +72,8 @@ function DeviceFileRow({
   onDeleteClick,
 }: DeviceFileRowProps) {
   const filename = recording.deviceFilename
-  const isDownloading = useIsDownloading(recording.id)
-  const downloadProgress = useDownloadProgress(recording.id)
+  const isDownloading = useIsDownloading(filename)
+  const downloadProgress = useDownloadProgress(filename)
 
   // FL-002: Show "—" for unknown/zero duration instead of "0:00"
   const durationDisplay = (!recording.duration || recording.duration === 0)
@@ -151,7 +152,7 @@ function DeviceFileRow({
       <div className="flex items-center gap-1 justify-end">
         {showDownloadButton && (
           <Button size="sm" variant="outline" className="h-7 px-2 text-xs"
-            onClick={() => onDownload(filename, recording.size)}>
+            onClick={() => onDownload(filename)}>
             <Download className="h-3 w-3 mr-1" />
             DL
           </Button>
@@ -168,6 +169,7 @@ function DeviceFileRow({
 
 export function DeviceFileList({ recordings, syncedFilenames, onRefresh, onRecordingsRefresh }: DeviceFileListProps) {
   const deviceService = getHiDockDeviceService()
+  const { queueDownload, queueBulkDownloads } = useOperations()
   const [downloadErrors, setDownloadErrors] = useState<Map<string, string>>(new Map())
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false)
   const [fileToDelete, setFileToDelete] = useState<string | null>(null)
@@ -240,18 +242,17 @@ export function DeviceFileList({ recordings, syncedFilenames, onRefresh, onRecor
   }, [selectedIds.size, sortedRecordings])
 
   // Handle individual file download
-  const handleDownloadFile = useCallback(async (filename: string, fileSize: number) => {
-    const recordingId = deviceRecordings.find(r => r.deviceFilename === filename)?.id
+  const handleDownloadFile = useCallback(async (filename: string) => {
+    const recording = deviceRecordings.find(r => r.deviceFilename === filename)
+    const recordingId = recording?.id
     if (recordingId) {
       setDownloadErrors(prev => { const m = new Map(prev); m.delete(recordingId); return m })
     }
+    if (!recording || recording.location !== 'device-only') return
+
     try {
-      const success = await deviceService.downloadRecordingToFile(filename, fileSize)
-      if (success) {
-        toast.success(`Downloaded ${filename}`)
-        onRefresh?.()
-        onRecordingsRefresh?.()
-      } else {
+      const queued = await queueDownload(recording)
+      if (!queued) {
         toast.error(`Failed to download ${filename}`)
         if (recordingId) setDownloadErrors(prev => new Map(prev).set(recordingId, 'Download failed'))
       }
@@ -260,7 +261,7 @@ export function DeviceFileList({ recordings, syncedFilenames, onRefresh, onRecor
       toast.error(error?.message || `Failed to download ${filename}`)
       if (recordingId) setDownloadErrors(prev => new Map(prev).set(recordingId, error?.message || 'Download failed'))
     }
-  }, [deviceService, deviceRecordings, onRefresh, onRecordingsRefresh])
+  }, [deviceRecordings, queueDownload])
 
   const handleDeleteClick = useCallback((filename: string) => {
     setFileToDelete(filename)
@@ -292,11 +293,11 @@ export function DeviceFileList({ recordings, syncedFilenames, onRefresh, onRecor
   if (deviceRecordings.length === 0) return null
 
   const recordingToDelete = deviceRecordings.find(r => r.deviceFilename === fileToDelete)
-  const hasLocalCopy = recordingToDelete?.location === 'both' || recordingToDelete?.location === 'local-only'
+  const hasLocalCopy = recordingToDelete?.location === 'both'
 
   // FL-005: Batch download
   const selectedUndownloaded = sortedRecordings.filter(
-    r => selectedIds.has(r.id) && r.location === 'device-only'
+    r => selectedIds.has(r.id) && r.location === 'device-only' && !isFilenameSynced(r.deviceFilename, syncedFilenames)
   )
   const allSelectedSynced = selectedIds.size > 0 && selectedUndownloaded.length === 0
 
@@ -334,8 +335,9 @@ export function DeviceFileList({ recordings, syncedFilenames, onRefresh, onRecor
                 size="sm"
                 variant="default"
                 disabled={allSelectedSynced}
-                onClick={() => {
-                  selectedUndownloaded.forEach(r => handleDownloadFile(r.deviceFilename, r.size))
+                onClick={async () => {
+                  const queued = await queueBulkDownloads(selectedUndownloaded)
+                  if (queued > 0) setSelectedIds(new Set())
                 }}
               >
                 <Download className="h-4 w-4 mr-1" />
