@@ -1378,6 +1378,10 @@ export class JensenDevice {
     onNewFiles?: (files: FileInfo[]) => void
   ): Promise<FileInfo[]> {
     return this.withLock('listFiles', async () => {
+      // A previous cancelled/stalled transfer can leave the shared abort flag set.
+      // New user-initiated operations must start from a clean protocol state.
+      this.abortOperations = false
+
       if (!this.device) {
         throw new Error('Device not connected')
       }
@@ -1682,6 +1686,10 @@ export class JensenDevice {
     signal?: AbortSignal
   ): Promise<boolean> {
     return this.withLock(`downloadFile:${filename}`, async () => {
+      // Reset stale cancellation state from a previous transfer before starting
+      // this locked operation. The current AbortSignal is checked immediately below.
+      this.abortOperations = false
+
       if (!this.device || !this.device.opened) return false
 
       // Check if already aborted before starting
@@ -1702,79 +1710,79 @@ export class JensenDevice {
       }
       signal?.addEventListener('abort', abortHandler)
 
-      const body: number[] = []
-      for (let i = 0; i < filename.length; i++) {
-        body.push(filename.charCodeAt(i))
-      }
-
-      // Send transfer file command
-      const seqId = this.sequenceId++
-      const msg = new JensenMessage(CMD.TRANSFER_FILE).body(body)
-      msg.sequence(seqId)
-      await this.device.transferOut(1, msg.make() as unknown as BufferSource)
-      if (shouldLogProtocol()) console.log(`[Jensen] downloadFile: Sent TRANSFER_FILE command, seq=${seqId}`)
-
-      // Receive file data
-      let received = 0
-      let consecutiveTimeouts = 0
-      const maxTimeouts = 100 // More tolerance for slow USB
-      const startTime = Date.now()
-      const overallTimeout = 300000 // 5 minutes max for large files
-
-      let lastProgressLog = 0
-      while (received < fileSize && consecutiveTimeouts < maxTimeouts && Date.now() - startTime < overallTimeout && !this.abortOperations) {
-        // Check for abort request (from disconnect or AbortSignal)
-        if (this.abortOperations || signal?.aborted) {
-          signal?.removeEventListener('abort', abortHandler)
-          if (shouldLogProtocol()) console.log(`[Jensen] downloadFile: Aborted (flag=${this.abortOperations}, signal=${signal?.aborted})`)
-          return false
+      try {
+        const body: number[] = []
+        for (let i = 0; i < filename.length; i++) {
+          body.push(filename.charCodeAt(i))
         }
 
-        // Read more data from USB
-        const gotData = await this.readToBuffer()
+        // Send transfer file command
+        const seqId = this.sequenceId++
+        const msg = new JensenMessage(CMD.TRANSFER_FILE).body(body)
+        msg.sequence(seqId)
+        await this.device.transferOut(1, msg.make() as unknown as BufferSource)
+        if (shouldLogProtocol()) console.log(`[Jensen] downloadFile: Sent TRANSFER_FILE command, seq=${seqId}`)
 
-        if (!gotData) {
-          consecutiveTimeouts++
-          // Small delay to prevent busy-waiting and give USB time to buffer data
-          await this.delay(20)
-          continue
-        }
-        consecutiveTimeouts = 0
+        // Receive file data
+        let received = 0
+        let consecutiveTimeouts = 0
+        const maxTimeouts = 100 // More tolerance for slow USB
+        const startTime = Date.now()
+        const overallTimeout = 300000 // 5 minutes max for large files
 
-        // Try to extract file data messages from buffer
-        while (received < fileSize) {
-          const msg = this.tryParseMessage()
-          if (!msg) break
+        let lastProgressLog = 0
+        while (received < fileSize && consecutiveTimeouts < maxTimeouts && Date.now() - startTime < overallTimeout && !this.abortOperations) {
+          // Check for abort request (from disconnect or AbortSignal)
+          if (this.abortOperations || signal?.aborted) {
+            if (shouldLogProtocol()) console.log(`[Jensen] downloadFile: Aborted (flag=${this.abortOperations}, signal=${signal?.aborted})`)
+            return false
+          }
 
-          if (msg.id === CMD.TRANSFER_FILE && msg.body.length > 0) {
-            onChunk(msg.body)
-            received += msg.body.length
-            onProgress?.(received)
+          // Read more data from USB
+          const gotData = await this.readToBuffer()
 
-            // Log progress every 10%
-            const percent = Math.floor((received / fileSize) * 100)
-            if (percent >= lastProgressLog + 10) {
-              if (shouldLogProtocol()) console.log(`[Jensen] Download progress: ${percent}% (${received}/${fileSize} bytes)`)
-              lastProgressLog = percent
+          if (!gotData) {
+            consecutiveTimeouts++
+            // Small delay to prevent busy-waiting and give USB time to buffer data
+            await this.delay(20)
+            continue
+          }
+          consecutiveTimeouts = 0
+
+          // Try to extract file data messages from buffer
+          while (received < fileSize) {
+            const msg = this.tryParseMessage()
+            if (!msg) break
+
+            if (msg.id === CMD.TRANSFER_FILE && msg.body.length > 0) {
+              onChunk(msg.body)
+              received += msg.body.length
+              onProgress?.(received)
+
+              // Log progress every 10%
+              const percent = Math.floor((received / fileSize) * 100)
+              if (percent >= lastProgressLog + 10) {
+                if (shouldLogProtocol()) console.log(`[Jensen] Download progress: ${percent}% (${received}/${fileSize} bytes)`)
+                lastProgressLog = percent
+              }
             }
           }
         }
-      }
 
-      // Cleanup abort listener
-      signal?.removeEventListener('abort', abortHandler)
-
-      const success = received >= fileSize
-      if (!success) {
-        if (this.abortOperations || signal?.aborted) {
-          if (shouldLogProtocol()) console.log(`[Jensen] downloadFile: Cancelled after receiving ${received}/${fileSize} bytes`)
-        } else {
-          console.error(`[Jensen] downloadFile FAILED: received=${received}/${fileSize}, consecutiveTimeouts=${consecutiveTimeouts}, elapsed=${Date.now() - startTime}ms`)
+        const success = received >= fileSize
+        if (!success) {
+          if (this.abortOperations || signal?.aborted) {
+            if (shouldLogProtocol()) console.log(`[Jensen] downloadFile: Cancelled after receiving ${received}/${fileSize} bytes`)
+          } else {
+            console.error(`[Jensen] downloadFile FAILED: received=${received}/${fileSize}, consecutiveTimeouts=${consecutiveTimeouts}, elapsed=${Date.now() - startTime}ms`)
+          }
+        } else if (shouldLogProtocol()) {
+          console.log(`[Jensen] downloadFile: Complete, received=${received}/${fileSize} in ${Date.now() - startTime}ms`)
         }
-      } else if (shouldLogProtocol()) {
-        console.log(`[Jensen] downloadFile: Complete, received=${received}/${fileSize} in ${Date.now() - startTime}ms`)
+        return success
+      } finally {
+        signal?.removeEventListener('abort', abortHandler)
       }
-      return success
     })
   }
 

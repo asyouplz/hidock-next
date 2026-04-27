@@ -180,131 +180,181 @@ export function useDownloadOrchestrator() {
     // DL-008: Set lock before first await to prevent double-processing
     isProcessingDownloads.current = true
 
-    const state = await window.electronAPI.downloadService.getState()
-    const pendingItems = state.queue.filter((item: DownloadQueueItem) => item.status === 'pending')
-
-    if (pendingItems.length === 0 || !deviceService.isConnected()) {
-      isProcessingDownloads.current = false
-      return
-    }
     downloadAbortControllerRef.current = new AbortController()
-    // DL-14: Sync module-level ref so cancelDownloads() can abort from outside
+    // DL-14: Sync module-level ref so cancelDownloads can abort from outside
     _downloadAbortControllerRef = downloadAbortControllerRef.current
     const signal = downloadAbortControllerRef.current.signal
-
-    if (shouldLogQa()) console.log(`[QA-MONITOR][Operation] Processing ${pendingItems.length} downloads`)
-
-    // C-004: Compute total bytes for ETA calculation
-    const totalBytes = pendingItems.reduce((sum: number, item: DownloadQueueItem) => sum + (item.fileSize || 0), 0)
     const syncStartTime = Date.now()
-
-    // DL-02: Emit initial progress event immediately after queue creation
-    // so the sidebar shows 0/total before the first file starts downloading
-    setDeviceSyncState({
-      deviceSyncing: true,
-      deviceSyncProgress: { current: 0, total: pendingItems.length },
-      deviceFileProgress: 0,
-      deviceFileDownloading: pendingItems[0]?.filename ?? null,
-      deviceSyncStartTime: syncStartTime,
-      deviceSyncBytesDownloaded: 0,
-      deviceSyncTotalBytes: totalBytes,
-      deviceSyncEta: null
-    })
 
     let completed = 0
     let failed = 0
     let aborted = false
     let bytesDownloaded = 0
+    let totalFiles = 0
+    let totalBytes = 0
+    let syncStateStarted = false
+    const attemptedThisRun = new Set<string>()
 
-    // TODO: DL-10: Consider pipelining: start reading next file while writing current file to disk.
-    for (const item of pendingItems) {
-      if (signal.aborted) {
-        if (shouldLogQa()) console.log('[useDownloadOrchestrator] Download aborted by user')
-        aborted = true
-        break
+    try {
+      // Drain pending downloads until the queue is empty. This covers the common
+      // race where a second file is queued while the first transfer is still locked.
+      while (!signal.aborted) {
+        const state = await window.electronAPI.downloadService.getState()
+        const pendingItems = state.queue.filter(
+          (item: DownloadQueueItem) => item.status === 'pending' && !attemptedThisRun.has(item.filename)
+        )
+
+        if (pendingItems.length === 0) break
+
+        if (!deviceService.isConnected()) {
+          if (shouldLogQa()) console.log('[useDownloadOrchestrator] Device disconnected, stopping downloads')
+          aborted = true
+          break
+        }
+
+        totalFiles += pendingItems.length
+        totalBytes += pendingItems.reduce((sum: number, item: DownloadQueueItem) => sum + (item.fileSize || 0), 0)
+
+        if (shouldLogQa()) console.log(`[QA-MONITOR][Operation] Processing ${pendingItems.length} downloads`)
+
+        if (!syncStateStarted) {
+          // DL-02: Emit initial progress event immediately after queue creation
+          // so the sidebar shows 0/total before the first file starts downloading
+          setDeviceSyncState({
+            deviceSyncing: true,
+            deviceSyncProgress: { current: 0, total: totalFiles },
+            deviceFileProgress: 0,
+            deviceFileDownloading: pendingItems[0]?.filename ?? null,
+            deviceSyncStartTime: syncStartTime,
+            deviceSyncBytesDownloaded: 0,
+            deviceSyncTotalBytes: totalBytes,
+            deviceSyncEta: null
+          })
+          syncStateStarted = true
+        } else {
+          setDeviceSyncState({
+            deviceSyncProgress: { current: completed, total: totalFiles },
+            deviceSyncTotalBytes: totalBytes
+          })
+        }
+
+        // TODO: DL-10: Consider pipelining: start reading next file while writing current file to disk.
+        for (const item of pendingItems) {
+          attemptedThisRun.add(item.filename)
+
+          if (signal.aborted) {
+            if (shouldLogQa()) console.log('[useDownloadOrchestrator] Download aborted by user')
+            aborted = true
+            break
+          }
+
+          if (!deviceService.isConnected()) {
+            if (shouldLogQa()) console.log('[useDownloadOrchestrator] Device disconnected, stopping downloads')
+            aborted = true
+            break
+          }
+
+          const storeState = useAppStore.getState()
+          if (!storeState.deviceSyncing) {
+            if (shouldLogQa()) console.log('[useDownloadOrchestrator] Sync cancelled by user')
+            aborted = true
+            break
+          }
+
+          // DL-13: Only count completed (not failed) in progress numerator
+          // so the progress bar accurately reflects successful downloads
+          setDeviceSyncState({
+            deviceFileDownloading: item.filename,
+            deviceSyncProgress: { current: completed, total: totalFiles },
+            deviceFileProgress: 0
+          })
+
+          // DL-STALL: Track the currently downloading file so onStateUpdate can abort
+          // if the main process marks it failed (e.g., stall detection)
+          currentlyDownloadingRef.current = item.filename
+          let success = false
+          try {
+            success = await processDownload(item, signal)
+          } catch (error) {
+            console.error(`[useDownloadOrchestrator] Unhandled download error: ${item.filename}`, error)
+            failed++
+            continue
+          } finally {
+            currentlyDownloadingRef.current = null
+          }
+
+          if (success) {
+            completed++
+            bytesDownloaded += item.fileSize || 0
+          } else {
+            failed++
+          }
+
+          // C-004: Compute ETA based on elapsed time and bytes completed
+          const elapsed = (Date.now() - syncStartTime) / 1000 // seconds
+          if (elapsed > 0 && bytesDownloaded > 0 && totalBytes > 0) {
+            const bytesPerSecond = bytesDownloaded / elapsed
+            const remainingBytes = totalBytes - bytesDownloaded
+            const etaSeconds = Math.round(remainingBytes / bytesPerSecond)
+            setDeviceSyncState({
+              deviceSyncBytesDownloaded: bytesDownloaded,
+              deviceSyncEta: Number.isFinite(etaSeconds) && etaSeconds > 0 ? etaSeconds : null
+            })
+          }
+        }
+
+        if (aborted) break
+      }
+    } finally {
+      isProcessingDownloads.current = false
+      downloadAbortControllerRef.current = null
+      // DL-14: Clear module-level ref when processing finishes
+      _downloadAbortControllerRef = null
+      // DL-005: Reset cancel flag so subsequent cancels work correctly
+      _cancelInProgress = false
+      clearDeviceSyncState()
+
+      if (aborted) {
+        useAppStore.getState().clearDownloadQueue()
       }
 
-      if (!deviceService.isConnected()) {
-        if (shouldLogQa()) console.log('[useDownloadOrchestrator] Device disconnected, stopping downloads')
-        aborted = true
-        break
+      // B-DEV-007: Force refresh recordings after download completes
+      // Emit a custom event so useUnifiedRecordings can do a forced refresh (with device data)
+      // instead of just invalidating (which only refreshes cached data)
+      if (completed > 0) {
+        window.dispatchEvent(new CustomEvent('hidock:downloads-completed'))
       }
 
-      const storeState = useAppStore.getState()
-      if (!storeState.deviceSyncing) {
-        if (shouldLogQa()) console.log('[useDownloadOrchestrator] Sync cancelled by user')
-        aborted = true
-        break
-      }
-
-      // DL-13: Only count completed (not failed) in progress numerator
-      // so the progress bar accurately reflects successful downloads
-      setDeviceSyncState({
-        deviceFileDownloading: item.filename,
-        deviceSyncProgress: { current: completed, total: pendingItems.length },
-        deviceFileProgress: 0
-      })
-
-      // DL-STALL: Track the currently downloading file so onStateUpdate can abort
-      // if the main process marks it failed (e.g., stall detection)
-      currentlyDownloadingRef.current = item.filename
-      const success = await processDownload(item, signal)
-      currentlyDownloadingRef.current = null
-      if (success) {
-        completed++
-        bytesDownloaded += item.fileSize || 0
-      } else {
-        failed++
-      }
-
-      // C-004: Compute ETA based on elapsed time and bytes completed
-      const elapsed = (Date.now() - syncStartTime) / 1000 // seconds
-      if (elapsed > 0 && bytesDownloaded > 0 && totalBytes > 0) {
-        const bytesPerSecond = bytesDownloaded / elapsed
-        const remainingBytes = totalBytes - bytesDownloaded
-        const etaSeconds = Math.round(remainingBytes / bytesPerSecond)
-        setDeviceSyncState({
-          deviceSyncBytesDownloaded: bytesDownloaded,
-          deviceSyncEta: Number.isFinite(etaSeconds) && etaSeconds > 0 ? etaSeconds : null
+      if (completed > 0 || failed > 0 || aborted) {
+        toast({
+          title: aborted ? 'Sync cancelled' : (failed === 0 ? 'Sync complete' : 'Sync completed with errors'),
+          description: aborted
+            ? `Downloaded ${completed} of ${totalFiles} file${totalFiles !== 1 ? 's' : ''}`
+            : (failed === 0
+              ? `Downloaded ${completed} file${completed !== 1 ? 's' : ''}`
+              : `Downloaded ${completed}, failed ${failed}`),
+          variant: aborted ? 'default' : (failed === 0 ? 'success' : 'warning')
         })
+
+        // C-004: Show OS-level notification for download completion
+        try {
+          window.electronAPI.downloadService.notifyCompletion({ completed, failed, aborted })
+        } catch {
+          // Notification is non-critical, fail silently
+        }
       }
-    }
 
-    isProcessingDownloads.current = false
-    // DL-14: Clear module-level ref when processing finishes
-    _downloadAbortControllerRef = null
-    // DL-005: Reset cancel flag so subsequent cancels work correctly
-    _cancelInProgress = false
-    clearDeviceSyncState()
-
-    if (aborted) {
-      useAppStore.getState().clearDownloadQueue()
-    }
-
-    // B-DEV-007: Force refresh recordings after download completes
-    // Emit a custom event so useUnifiedRecordings can do a forced refresh (with device data)
-    // instead of just invalidating (which only refreshes cached data)
-    if (completed > 0) {
-      window.dispatchEvent(new CustomEvent('hidock:downloads-completed'))
-    }
-
-    if (completed > 0 || failed > 0 || aborted) {
-      toast({
-        title: aborted ? 'Sync cancelled' : (failed === 0 ? 'Sync complete' : 'Sync completed with errors'),
-        description: aborted
-          ? `Downloaded ${completed} of ${pendingItems.length} file${pendingItems.length !== 1 ? 's' : ''}`
-          : (failed === 0
-            ? `Downloaded ${completed} file${completed !== 1 ? 's' : ''}`
-            : `Downloaded ${completed}, failed ${failed}`),
-        variant: aborted ? 'default' : (failed === 0 ? 'success' : 'warning')
-      })
-
-      // C-004: Show OS-level notification for download completion
-      try {
-        window.electronAPI.downloadService.notifyCompletion({ completed, failed, aborted })
-      } catch {
-        // Notification is non-critical, fail silently
-      }
+      // Close the race where an item was queued while this processor was still
+      // locked and its state-update event was ignored.
+      window.electronAPI.downloadService.getState().then((state) => {
+        const hasPending = state.queue.some(
+          (item: DownloadQueueItem) => item.status === 'pending' && !attemptedThisRun.has(item.filename)
+        )
+        const isDeviceReady = useAppStore.getState().connectionStatus.step === 'ready'
+        if (hasPending && !isProcessingDownloads.current && deviceService.isConnected() && isDeviceReady) {
+          processDownloadQueue()
+        }
+      }).catch(() => {})
     }
   }, [deviceService, processDownload, setDeviceSyncState, clearDeviceSyncState])
 
